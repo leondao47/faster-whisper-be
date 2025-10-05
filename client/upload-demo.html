@@ -1,0 +1,84 @@
+<!doctype html>
+<html>
+  <body>
+    <h3>Record → Upload → Transcribe (no WebSocket)</h3>
+    <button id="start">Start</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="upload" disabled>Upload & Transcribe</button>
+    <p id="status">Idle</p>
+    <audio id="player" controls></audio>
+    <pre id="result"></pre>
+
+    <script>
+      const statusEl = document.getElementById('status');
+      const player = document.getElementById('player');
+      const result = document.getElementById('result');
+      let mediaRecorder, chunks = [], mimeType;
+
+      async function getSupportedMimeType() {
+        const types = [
+          'audio/webm;codecs=opus',
+          'audio/webm',
+          'audio/ogg;codecs=opus',
+          'audio/ogg'
+        ];
+        for (const t of types) {
+          if (MediaRecorder.isTypeSupported(t)) return t;
+        }
+        return ''; // let browser choose default
+      }
+
+      document.getElementById('start').onclick = async () => {
+        chunks = [];
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+        });
+
+        mimeType = await getSupportedMimeType();
+        mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+        mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+        mediaRecorder.onstart = () => { statusEl.textContent = 'Recording...'; };
+        mediaRecorder.start(250); // timeslice (ms)
+
+        document.getElementById('start').disabled = true;
+        document.getElementById('stop').disabled = false;
+        document.getElementById('upload').disabled = true;
+      };
+
+      document.getElementById('stop').onclick = async () => {
+        mediaRecorder.stop();
+        mediaRecorder.stream.getTracks().forEach(t => t.stop());
+        statusEl.textContent = 'Stopped. Ready to upload.';
+        document.getElementById('start').disabled = false;
+        document.getElementById('stop').disabled = true;
+        document.getElementById('upload').disabled = false;
+
+        // preview
+        const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
+        player.src = URL.createObjectURL(blob);
+      };
+
+      document.getElementById('upload').onclick = async () => {
+        const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
+        const form = new FormData();
+        const filename = (mimeType && mimeType.includes('ogg')) ? 'recording.ogg' : 'recording.webm';
+        form.append('file', blob, filename);
+
+        statusEl.textContent = 'Uploading...';
+        result.textContent = '';
+        try {
+          const res = await fetch('http://localhost:8000/v1/transcribe', {
+            method: 'POST',
+            body: form
+          });
+          const json = await res.json();
+          statusEl.textContent = 'Done.';
+          result.textContent = JSON.stringify(json, null, 2);
+        } catch (e) {
+          statusEl.textContent = 'Upload/transcribe failed';
+          result.textContent = String(e);
+        }
+      };
+    </script>
+  </body>
+</html>

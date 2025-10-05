@@ -1,0 +1,120 @@
+<!doctype html>
+<html>
+  <body>
+    <button id="start">Start</button>
+    <button id="stop" disabled>Stop</button>
+    <pre id="log"></pre>
+    <script>
+      const log = (...a) => (document.getElementById('log').textContent += a.join(' ') + '\n');
+
+      let ws, audioCtx, processor, source, stream, running = false;
+      let resampleBuffer = new Float32Array(0);
+
+      // ---- helpers ----
+      function floatTo16BitPCM(float32) {
+        const out = new Int16Array(float32.length);
+        for (let i = 0; i < float32.length; i++) {
+          const s = Math.max(-1, Math.min(1, float32[i]));
+          out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        return out;
+      }
+
+      // naive linear resampler: from srcRate -> 16000
+      function resampleTo16k(float32, srcRate) {
+        if (srcRate === 16000) return float32;
+        const ratio = 16000 / srcRate;
+        const newLen = Math.floor(float32.length * ratio);
+        const out = new Float32Array(newLen);
+        for (let i = 0; i < newLen; i++) {
+          const srcPos = i / ratio;
+          const i0 = Math.floor(srcPos);
+          const i1 = Math.min(i0 + 1, float32.length - 1);
+          const t = srcPos - i0;
+          out[i] = (1 - t) * float32[i0] + t * float32[i1];
+        }
+        return out;
+      }
+
+      // slice buffered 16k float audio into exact 20ms (320-sample) frames and send
+      function sendIn20msFrames(float16k) {
+        const need = 320; // 20ms at 16k
+        // concat to residual
+        const merged = new Float32Array(resampleBuffer.length + float16k.length);
+        merged.set(resampleBuffer, 0);
+        merged.set(float16k, resampleBuffer.length);
+
+        const totalFrames = Math.floor(merged.length / need);
+        for (let f = 0; f < totalFrames; f++) {
+          const start = f * need;
+          const slice = merged.subarray(start, start + need);
+          const pcm16 = floatTo16BitPCM(slice);
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(pcm16.buffer); // 640 bytes
+          }
+        }
+        const leftover = merged.length - totalFrames * need;
+        resampleBuffer = leftover ? merged.subarray(merged.length - leftover) : new Float32Array(0);
+      }
+
+      async function start() {
+        running = true;
+
+        ws = new WebSocket('ws://localhost:8000/v1/stream');
+        ws.binaryType = 'arraybuffer';
+        ws.onopen = () => {
+          log('WS open');
+          ws.send(JSON.stringify({ event: 'start', lang: 'en' }));
+        };
+        ws.onmessage = (ev) => log(ev.data);
+        ws.onclose = () => log('WS closed');
+
+        // mic
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            noiseSuppression: false,
+            echoCancellation: false,
+            autoGainControl: false
+          }
+        });
+
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        log('Input sampleRate =', audioCtx.sampleRate);
+
+        source = audioCtx.createMediaStreamSource(stream);
+        // Use ScriptProcessor for simplicity (works widely). Buffer size 2048 @ 48k ~ 42.7ms.
+        const bufferSize = 2048;
+        processor = audioCtx.createScriptProcessor(bufferSize, 1, 1);
+        processor.onaudioprocess = (e) => {
+          if (!running) return;
+          const inBuf = e.inputBuffer.getChannelData(0);
+          // resample to exactly 16k
+          const f16k = resampleTo16k(inBuf, audioCtx.sampleRate);
+          // ship as 20ms frames
+          sendIn20msFrames(f16k);
+        };
+        source.connect(processor);
+        processor.connect(audioCtx.destination);
+
+        document.getElementById('start').disabled = true;
+        document.getElementById('stop').disabled = false;
+      }
+
+      function stop() {
+        running = false;
+        resampleBuffer = new Float32Array(0);
+        if (processor) processor.disconnect();
+        if (source) source.disconnect();
+        if (audioCtx) audioCtx.close();
+        if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+        if (stream) stream.getTracks().forEach(t => t.stop());
+        document.getElementById('start').disabled = false;
+        document.getElementById('stop').disabled = true;
+      }
+
+      document.getElementById('start').onclick = start;
+      document.getElementById('stop').onclick = stop;
+    </script>
+  </body>
+</html>
